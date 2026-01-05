@@ -1,3 +1,11 @@
 docs/source/
 .env 
 data/faiss_index/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Chainlit (local runtime artifacts)
+.files/
