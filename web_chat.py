@@ -1,13 +1,29 @@
 from __future__ import annotations
 
-import asyncio
-from typing import Any
+from typing import cast
 
 import chainlit as cl
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
 from langchain_anthropic import ChatAnthropic
 from langchain_google_genai import ChatGoogleGenerativeAI
+
+# Vector retrieval (FAISS + local embeddings)
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+
+# LangChain Runnable(LCEL) building blocks
+try:
+    # Newer import paths
+    from langchain_core.output_parsers import StrOutputParser
+    from langchain_core.prompts import ChatPromptTemplate
+    from langchain_core.runnables import Runnable, RunnableLambda, RunnablePassthrough
+    from langchain_core.runnables.config import RunnableConfig
+except Exception:
+    # Fallbacks for older versions
+    from langchain.schema import StrOutputParser  # type: ignore
+    from langchain.prompts import ChatPromptTemplate  # type: ignore
+    from langchain.schema.runnable import Runnable  # type: ignore
+    from langchain.schema.runnable.config import RunnableConfig  # type: ignore
+    from langchain.schema.runnable import RunnableLambda, RunnablePassthrough  # type: ignore
 
 import config
 
@@ -17,11 +33,20 @@ def build_llm():
 
     if config.LLM_PROVIDER == "claude":
         # .env에 ANTHROPIC_API_KEY가 있어야 함
-        return ChatAnthropic(model=config.CLAUDE_MODEL, temperature=0)
+        # Chainlit 예제처럼 token streaming을 쓰기 위해 streaming=True를 시도한다.
+        try:
+            return ChatAnthropic(model=config.CLAUDE_MODEL, temperature=0, streaming=True)
+        except TypeError:
+            return ChatAnthropic(model=config.CLAUDE_MODEL, temperature=0)
 
     if config.LLM_PROVIDER == "gemini":
         # .env에 GOOGLE_API_KEY가 있어야 함
-        return ChatGoogleGenerativeAI(model=config.GEMINI_MODEL, temperature=0)
+        try:
+            return ChatGoogleGenerativeAI(
+                model=config.GEMINI_MODEL, temperature=0, streaming=True
+            )
+        except TypeError:
+            return ChatGoogleGenerativeAI(model=config.GEMINI_MODEL, temperature=0)
 
     raise ValueError("Unknown LLM_PROVIDER")
 
@@ -59,9 +84,42 @@ async def on_chat_start() -> None:
     # 3) LLM 준비 (Claude/Gemini 스위치)
     llm = build_llm()
 
-    # 4) Chainlit 세션에 보관
-    cl.user_session.set("retriever", retriever)
-    cl.user_session.set("llm", llm)
+    # 4) Prompt + Runnable(LCEL) 구성
+    # Chainlit의 Steps/Trace UI는 Runnable 실행 시 발생하는 중간 이벤트를
+    # cl.LangchainCallbackHandler()가 받아서 표시한다.
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                """당신은 유능하고 친절한 어시스턴트입니다.
+
+반드시 아래 제공된 [참고 문헌]의 내용만을 바탕으로 답변하세요.
+만약 질문에 대한 답이 [참고 문헌]에 없다면, \"제공된 문서에서 관련 내용을 찾을 수 없습니다\"라고 답하세요.
+답변이 끝나면 반드시 답변에 사용된 [출처]의 파일명을 나열하세요.
+""",
+            ),
+            (
+                "human",
+                """[참고 문헌]\n{context}\n\n[질문]\n{question}\n""",
+            ),
+        ]
+    )
+
+    # 입력은 {"question": "..."}
+    # - docs: retriever(question)
+    # - context: format_context(docs)
+    get_question = RunnableLambda(lambda x: x["question"])
+    docs_runnable = get_question | retriever
+    runnable: Runnable = (
+        RunnablePassthrough.assign(docs=docs_runnable)
+        .assign(context=RunnableLambda(lambda x: format_context(x["docs"])))
+        | prompt
+        | llm
+        | StrOutputParser()
+    )
+
+    # 5) Chainlit 세션에 보관
+    cl.user_session.set("runnable", runnable)
 
     await cl.Message(
         content=(
@@ -80,36 +138,17 @@ async def on_message(message: cl.Message) -> None:
         await cl.Message(content="질문을 입력해줘.").send()
         return
 
-    retriever = cl.user_session.get("retriever")
-    llm = cl.user_session.get("llm")
+    runnable = cast(Runnable, cl.user_session.get("runnable"))
 
-    # 1) 관련 문서 검색 (Runnable 기반 -> invoke 사용)
-    #    retriever.invoke는 sync 함수인 경우가 많아서, asyncio.to_thread로 감싸 UI를 덜 막는다.
-    docs = await asyncio.to_thread(retriever.invoke, question)
-    context = format_context(docs)
+    # Chainlit Steps/Trace UI를 켜는 핵심: LangchainCallbackHandler
+    cb = cl.LangchainCallbackHandler()
+    msg = cl.Message(content="")
 
-    # 2) 프롬프트: 근거 기반 답변 강제
-    prompt = f"""당신은 유능하고 친절한 어시스턴트입니다.
+    # astream으로 토큰(또는 chunk)을 스트리밍하면 UI에 타이핑처럼 표시된다.
+    async for chunk in runnable.astream(
+        {"question": question},
+        config=RunnableConfig(callbacks=[cb]),
+    ):
+        await msg.stream_token(chunk)
 
-반드시 아래 제공된 [참고 문헌]의 내용만을 바탕으로 답변하세요.
-만약 질문에 대한 답이 [참고 문헌]에 없다면, \"제공된 문서에서 관련 내용을 찾을 수 없습니다\"라고 답하세요.
-답변이 끝나면 반드시 답변에 사용된 [출처]의 파일명을 나열하세요.
-
-[참고 문헌]
-{context}
-
-[질문]
-{question}
-"""
-
-    # 3) LLM 호출 (역시 sync일 수 있어 to_thread로 처리)
-    result: Any = await asyncio.to_thread(llm.invoke, prompt)
-    answer = getattr(result, "content", result)
-
-    # 4) 응답 + 근거 표시
-    sources = [d.metadata.get("source", "unknown") for d in docs]
-    sources_text = "\n".join(f"- {s}" for s in sources) if sources else "- (none)"
-
-    await cl.Message(
-        content=f"{answer}\n\n---\n\n[retrieved sources]\n{sources_text}"
-    ).send()
+    await msg.send()
